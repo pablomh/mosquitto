@@ -20,7 +20,11 @@ Contributors:
 
 #include <errno.h>
 #ifndef WIN32
+#ifdef HAVE_PPOLL
+#include <sys/poll.h>
+#else
 #include <sys/select.h>
+#endif
 #include <time.h>
 #endif
 
@@ -32,18 +36,26 @@ Contributors:
 #include "tls_mosq.h"
 #include "util_mosq.h"
 
+#ifndef HAVE_PPOLL
 #if !defined(WIN32) && !defined(__SYMBIAN32__) && !defined(__QNX__)
 #define HAVE_PSELECT
+#endif
 #endif
 
 int mosquitto_loop(struct mosquitto *mosq, int timeout, int max_packets)
 {
-#ifdef HAVE_PSELECT
+#if defined(HAVE_PSELECT) || defined(HAVE_PPOLL)
 	struct timespec local_timeout;
 #else
 	struct timeval local_timeout;
 #endif
+#ifdef HAVE_PPOLL
+	int sockR, sockW, sockRr;
+	int readyR, readyW, readyRr;
+	struct pollfd pfd[3];
+#else
 	fd_set readfds, writefds;
+#endif
 	int fdcount;
 	int rc;
 	char pairbuf;
@@ -52,19 +64,35 @@ int mosquitto_loop(struct mosquitto *mosq, int timeout, int max_packets)
 	time_t timeout_ms;
 
 	if(!mosq || max_packets < 1) return MOSQ_ERR_INVAL;
+#ifndef HAVE_PPOLL
 #ifndef WIN32
 	if(mosq->sock >= FD_SETSIZE || mosq->sockpairR >= FD_SETSIZE){
 		return MOSQ_ERR_INVAL;
 	}
 #endif
+#endif
 
+#ifdef HAVE_PPOLL
+	sockR = sockW = sockRr = 0;
+	readyR = readyW = readyRr = 0;
+#else
 	FD_ZERO(&readfds);
 	FD_ZERO(&writefds);
+#endif
+
 	if(mosq->sock != INVALID_SOCKET){
+#ifdef HAVE_PPOLL
+		sockR = mosq->sock;
+#else
 		maxfd = mosq->sock;
 		FD_SET(mosq->sock, &readfds);
+#endif
 		if(mosq->want_write){
+#ifdef HAVE_PPOLL
+			sockW = mosq->sock;
+#else
 			FD_SET(mosq->sock, &writefds);
+#endif
 		}else{
 #ifdef WITH_TLS
 			if(mosq->ssl == NULL || SSL_is_init_finished(mosq->ssl))
@@ -73,7 +101,11 @@ int mosquitto_loop(struct mosquitto *mosq, int timeout, int max_packets)
 				pthread_mutex_lock(&mosq->current_out_packet_mutex);
 				pthread_mutex_lock(&mosq->out_packet_mutex);
 				if(mosq->out_packet || mosq->current_out_packet){
+#ifdef HAVE_PPOLL
+					sockW = mosq->sock;
+#else
 					FD_SET(mosq->sock, &writefds);
+#endif
 				}
 				pthread_mutex_unlock(&mosq->out_packet_mutex);
 				pthread_mutex_unlock(&mosq->current_out_packet_mutex);
@@ -98,7 +130,11 @@ int mosquitto_loop(struct mosquitto *mosq, int timeout, int max_packets)
 	if(mosq->sockpairR != INVALID_SOCKET){
 		/* sockpairR is used to break out of select() before the timeout, on a
 		 * call to publish() etc. */
+#ifdef HAVE_PPOLL
+		sockRr = mosq->sockpairR;
+#else
 		FD_SET(mosq->sockpairR, &readfds);
+#endif
 		if((int)mosq->sockpairR > maxfd){
 			maxfd = mosq->sockpairR;
 		}
@@ -123,13 +159,46 @@ int mosquitto_loop(struct mosquitto *mosq, int timeout, int max_packets)
 	}
 
 	local_timeout.tv_sec = timeout_ms/1000;
-#ifdef HAVE_PSELECT
+#if defined(HAVE_PSELECT) || defined(HAVE_PPOLL)
 	local_timeout.tv_nsec = (timeout_ms-local_timeout.tv_sec*1000)*1000000;
 #else
 	local_timeout.tv_usec = (timeout_ms-local_timeout.tv_sec*1000)*1000;
 #endif
 
-#ifdef HAVE_PSELECT
+#ifdef HAVE_PPOLL
+	maxfd = 0;
+	if (sockR){
+		pfd[maxfd].fd = sockR;
+		pfd[maxfd].events = POLLIN;
+		pfd[maxfd].revents = 0;
+		maxfd++;
+	}
+	if (sockW){
+		pfd[maxfd].fd = sockW;
+		pfd[maxfd].events = POLLOUT;
+		pfd[maxfd].revents = 0;
+		maxfd++;
+	}
+	if (sockRr){
+		pfd[maxfd].fd = sockRr;
+		pfd[maxfd].events = POLLIN;
+		pfd[maxfd].revents = 0;
+		maxfd++;
+	}
+	fdcount = ppoll(pfd,maxfd,&local_timeout, NULL);
+	int i;
+	for (i=0; i<maxfd; i++){
+		if (pfd[i].fd == sockR &&
+		    (pfd[i].revents & (POLLRDNORM|POLLRDBAND|POLLIN|POLLHUP|POLLERR)))
+			readyR = 1;
+		if (pfd[i].fd == sockRr &&
+		    (pfd[i].revents & (POLLRDNORM|POLLRDBAND|POLLIN|POLLHUP|POLLERR)))
+			readyRr = 1;
+		if (pfd[i].fd == sockW &&
+		    (pfd[i].revents & (POLLWRNORM|POLLWRBAND|POLLOUT|POLLERR)))
+			readyW = 1;
+	}
+#elif defined(HAVE_PSELECT)
 	fdcount = pselect(maxfd+1, &readfds, &writefds, NULL, &local_timeout, NULL);
 #else
 	fdcount = select(maxfd+1, &readfds, &writefds, NULL, &local_timeout);
@@ -145,13 +214,21 @@ int mosquitto_loop(struct mosquitto *mosq, int timeout, int max_packets)
 		}
 	}else{
 		if(mosq->sock != INVALID_SOCKET){
+#ifdef HAVE_PPOLL
+			if(readyR){
+#else
 			if(FD_ISSET(mosq->sock, &readfds)){
+#endif
 				rc = mosquitto_loop_read(mosq, max_packets);
 				if(rc || mosq->sock == INVALID_SOCKET){
 					return rc;
 				}
 			}
+#ifdef HAVE_PPOLL
+			if(mosq->sockpairR != INVALID_SOCKET && readyRr){
+#else
 			if(mosq->sockpairR != INVALID_SOCKET && FD_ISSET(mosq->sockpairR, &readfds)){
+#endif
 #ifndef WIN32
 				if(read(mosq->sockpairR, &pairbuf, 1) == 0){
 				}
@@ -162,9 +239,17 @@ int mosquitto_loop(struct mosquitto *mosq, int timeout, int max_packets)
 				 * we didn't ask for it, because at that point the publish or
 				 * other command wasn't present. */
 				if(mosq->sock != INVALID_SOCKET)
+#ifdef HAVE_PPOLL
+					readyW = 1;
+#else
 					FD_SET(mosq->sock, &writefds);
+#endif
 			}
+#ifdef HAVE_PPOLL
+			if(mosq->sock != INVALID_SOCKET && readyW){
+#else
 			if(mosq->sock != INVALID_SOCKET && FD_ISSET(mosq->sock, &writefds)){
+#endif
 				rc = mosquitto_loop_write(mosq, max_packets);
 				if(rc || mosq->sock == INVALID_SOCKET){
 					return rc;
@@ -183,12 +268,16 @@ int mosquitto_loop(struct mosquitto *mosq, int timeout, int max_packets)
 
 static int interruptible_sleep(struct mosquitto *mosq, time_t reconnect_delay)
 {
-#ifdef HAVE_PSELECT
+#if defined(HAVE_PSELECT) || defined(HAVE_PPOLL)
 	struct timespec local_timeout;
 #else
 	struct timeval local_timeout;
 #endif
+#ifdef HAVE_PPOLL
+	struct pollfd pfd[1];
+#else
 	fd_set readfds;
+#endif
 	int fdcount;
 	char pairbuf;
 	int maxfd = 0;
@@ -200,20 +289,30 @@ static int interruptible_sleep(struct mosquitto *mosq, time_t reconnect_delay)
 #endif
 
 	local_timeout.tv_sec = reconnect_delay;
-#ifdef HAVE_PSELECT
+#if defined(HAVE_PSELECT) || defined(HAVE_PPOLL)
 	local_timeout.tv_nsec = 0;
 #else
 	local_timeout.tv_usec = 0;
 #endif
+#ifndef HAVE_PPOLL
 	FD_ZERO(&readfds);
+#endif
 	maxfd = 0;
 	if(mosq->sockpairR != INVALID_SOCKET){
 		/* sockpairR is used to break out of select() before the
 		 * timeout, when mosquitto_loop_stop() is called */
+#ifdef HAVE_PPOLL
+		pfd[0].fd = mosq->sockpairR;
+		pfd[0].events = POLLIN;
+		maxfd = 1;
+#else
 		FD_SET(mosq->sockpairR, &readfds);
 		maxfd = mosq->sockpairR;
+#endif
 	}
-#ifdef HAVE_PSELECT
+#ifdef HAVE_PPOLL
+	fdcount = ppoll(pfd, maxfd, &local_timeout, NULL);
+#elif defined(HAVE_PSELECT)
 	fdcount = pselect(maxfd+1, &readfds, NULL, NULL, &local_timeout, NULL);
 #else
 	fdcount = select(maxfd+1, &readfds, NULL, NULL, &local_timeout);
@@ -227,7 +326,11 @@ static int interruptible_sleep(struct mosquitto *mosq, time_t reconnect_delay)
 		}else{
 			return MOSQ_ERR_ERRNO;
 		}
+#ifdef HAVE_PPOLL
+	}else if(mosq->sockpairR != INVALID_SOCKET &&(pfd[0].revents & (POLLRDNORM|POLLRDBAND|POLLIN|POLLHUP|POLLERR))){
+#else
 	}else if(mosq->sockpairR != INVALID_SOCKET && FD_ISSET(mosq->sockpairR, &readfds)){
+#endif
 #ifndef WIN32
 		if(read(mosq->sockpairR, &pairbuf, 1) == 0){
 		}

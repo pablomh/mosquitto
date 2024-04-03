@@ -23,6 +23,11 @@ if(APPLE)
 	set(CMAKE_SHARED_LIBRARY_CREATE_C_FLAGS "${CMAKE_SHARED_LIBRARY_CREATE_C_FLAGS} -undefined dynamic_lookup")
 endif(APPLE)
 
+include(CheckSymbolExists)
+
+set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+check_symbol_exists(ppoll "sys/poll.h" HAVE_DECL_PPOLL)
+
 include(GNUInstallDirs)
 
 option(WITH_BUNDLED_DEPS "Build with bundled dependencies?" ON)
